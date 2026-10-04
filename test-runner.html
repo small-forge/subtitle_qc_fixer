@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Subtitle QC Fixer Test Runner</title>
+<style>
+body{font-family:system-ui;max-width:900px;margin:30px auto;padding:0 16px}
+.pass{color:green}.fail{color:red}pre{white-space:pre-wrap;border:1px solid #ddd;padding:12px}
+iframe{width:1px;height:1px;border:0;position:absolute;left:-9999px}
+</style>
+</head>
+<body>
+<h1>Subtitle QC Fixer Test Runner</h1>
+<p>index.html과 같은 디렉터리에서 실행합니다.</p>
+<button id="run">테스트 실행</button>
+<pre id="out">대기 중</pre>
+<iframe id="app" src="index.html"></iframe>
+<script>
+const fixture=`1
+00:00:00,000 --> 00:00:00,300
+짧음
+
+2
+00:00:00,200 --> 00:00:08,500
+이 cue는 이전 cue와 겹치고 표시 시간이 너무 깁니다.
+
+3
+00:00:09,000 --> 00:00:09,500
+아주빠르게읽어야하는긴문장아주빠르게읽어야하는긴문장아주빠르게읽어야하는긴문장
+
+4
+00:00:11,000 --> 00:00:10,000
+잘못된 시간 범위
+`;
+const expectedCodes=[
+  '1:TOO_SHORT',
+  '2:TOO_LONG',
+  '2:OVERLAP',
+  '3:HIGH_CPS',
+  '4:INVALID_RANGE',
+  '4:TOO_SHORT'
+];
+
+const out=document.getElementById('out');
+const frame=document.getElementById('app');
+const log=[];
+function line(ok,name,detail=''){
+  log.push((ok?'PASS ':'FAIL ')+name+(detail?' — '+detail:''));
+}
+function assert(cond,name,detail=''){
+  line(Boolean(cond),name,detail);
+  if(!cond) throw new Error(name+(detail?': '+detail:''));
+}
+function waitFrame(){
+  return new Promise((resolve,reject)=>{
+    const started=Date.now();
+    const check=()=>{
+      try{
+        const loaded=frame.contentDocument&&frame.contentDocument.readyState==='complete'
+          &&/\/index\.html$/.test(frame.contentWindow.location.pathname);
+        if(loaded)return resolve();
+      }catch(e){}
+      if(Date.now()-started>=5000)return reject(new Error('index.html load timeout'));
+      setTimeout(check,50);
+    };
+    check();
+  });
+}
+
+async function run(){
+  log.length=0;
+  out.className='';
+  try{
+    await waitFrame();
+    const w=frame.contentWindow;
+    const d=frame.contentDocument;
+    assert(typeof w.parseSubtitles==='function','parseSubtitles 노출');
+    assert(typeof w.qc==='function','qc 노출');
+    assert(typeof w.runSingle==='function','runSingle 노출');
+    assert(typeof w.runBatch==='function','runBatch 노출');
+    assert(typeof w.exportCsv==='function','exportCsv 노출');
+
+    const cues=w.parseSubtitles(fixture);
+    const issues=w.qc(cues,{minMs:500,maxMs:7000,maxCps:20});
+    const codes=issues.map(x=>x.cue+':'+x.code);
+    assert(cues.length===4,'코어 파서 cue 수',String(cues.length));
+    assert(issues.length===6,'코어 QC issue 수',String(issues.length));
+    assert(JSON.stringify(codes)===JSON.stringify(expectedCodes),'코어 QC 상세 코드',codes.join(', '));
+
+    d.getElementById('singleText').value=fixture;
+    w.runSingle();
+    assert(d.getElementById('singleSummary').textContent==='Cues 4 / Issues 6','무료 단일 파일 summary',d.getElementById('singleSummary').textContent);
+    assert(d.querySelectorAll('#singleOutput tbody tr,#singleOutput table tr').length-1===6,'무료 단일 파일 issue 행 수');
+
+    const dt=new w.DataTransfer();
+    dt.items.add(new w.File([fixture],'test-fixture.srt',{type:'application/x-subrip'}));
+    d.getElementById('batchFiles').files=dt.files;
+    await w.runBatch();
+    assert(d.getElementById('batchSummary').textContent==='Files 1 / Issues 6','배치 QC summary',d.getElementById('batchSummary').textContent);
+    assert(!d.getElementById('csvReport').disabled,'CSV 버튼 활성화');
+
+    d.getElementById('presetName').value='RelayPreset';
+    d.getElementById('minMs').value='600';
+    d.getElementById('maxMs').value='6500';
+    d.getElementById('maxCps').value='18';
+    d.getElementById('savePreset').click();
+    const saved=JSON.parse(w.localStorage.getItem('sqcf.presets.v1')||'{}');
+    assert(saved.RelayPreset&&saved.RelayPreset.minMs===600&&saved.RelayPreset.maxMs===6500&&saved.RelayPreset.maxCps===18,'프리셋 저장');
+    assert(d.getElementById('preset').value==='RelayPreset','프리셋 선택 유지');
+
+    let captured=null;
+    const oldCreate=w.URL.createObjectURL;
+    const oldRevoke=w.URL.revokeObjectURL;
+    const oldClick=w.HTMLAnchorElement.prototype.click;
+    w.URL.createObjectURL=blob=>{captured=blob;return 'blob:test';};
+    w.URL.revokeObjectURL=()=>{};
+    w.HTMLAnchorElement.prototype.click=function(){};
+    try{w.exportCsv();}finally{
+      w.URL.createObjectURL=oldCreate;
+      w.URL.revokeObjectURL=oldRevoke;
+      w.HTMLAnchorElement.prototype.click=oldClick;
+    }
+    assert(captured instanceof w.Blob,'CSV Blob 생성');
+    const csv=await captured.text();
+    assert(csv.includes('"file","cue","code","detail"'),'CSV 헤더');
+    assert(csv.includes('test-fixture.srt'),'CSV 파일명');
+    for(const code of ['TOO_SHORT','TOO_LONG','OVERLAP','HIGH_CPS','INVALID_RANGE']){
+      assert(csv.includes(code),'CSV 코드 '+code);
+    }
+
+    out.className='pass';
+    log.push('RESULT PASS');
+    document.title='RESULT PASS';
+  }catch(e){
+    out.className='fail';
+    log.push('RESULT FAIL — '+(e&&e.message?e.message:String(e)));
+    document.title='RESULT FAIL';
+  }
+  out.textContent=log.join('\n');
+}
+document.getElementById('run').onclick=run;
+if(new URLSearchParams(location.search).get('autorun')==='1'){
+  run();
+}
+</script>
+</body>
+</html>

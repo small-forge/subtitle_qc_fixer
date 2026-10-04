@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Subtitle QC Fixer</title>
+<style>
+body{font-family:system-ui;max-width:950px;margin:30px auto;padding:0 16px}
+section{border:1px solid #ddd;padding:14px;margin:14px 0}
+textarea{width:100%;min-height:180px;box-sizing:border-box}
+button,input,select{margin:5px;padding:7px}
+table{width:100%;border-collapse:collapse}th,td{border:1px solid #ccc;padding:6px;text-align:left}
+small{display:block;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>Subtitle QC Fixer</h1>
+<p>모든 처리는 브라우저 로컬에서 수행됩니다.</p>
+
+<section>
+<h2>단일 파일 기본 QC (무료)</h2>
+<input id="singleFile" type="file" accept=".srt,.vtt">
+<button id="runSingle">QC 실행</button>
+<textarea id="singleText" placeholder="SRT/VTT 내용을 붙여넣거나 파일을 선택하세요"></textarea>
+<div id="singleSummary"></div>
+<div id="singleOutput"></div>
+</section>
+
+<section>
+<h2>배치 QC + 프리셋 + CSV 보고서</h2>
+<label>프리셋 <select id="preset"></select></label>
+<input id="presetName" value="Basic" aria-label="프리셋 이름">
+<label>최소 ms <input id="minMs" type="number" value="500"></label>
+<label>최대 ms <input id="maxMs" type="number" value="7000"></label>
+<label>최대 CPS <input id="maxCps" type="number" value="20"></label>
+<button id="savePreset">프리셋 저장</button>
+<br>
+<input id="batchFiles" type="file" multiple accept=".srt,.vtt">
+<button id="runBatch">배치 QC</button>
+<button id="csvReport" disabled>CSV 보고서</button>
+<div id="batchSummary"></div>
+<div id="batchOutput"></div>
+<small>배치 QC, 재사용 프리셋, 내보내기 보고서는 유료 가치 검증 범위입니다.</small>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+const STORAGE_KEY='sqcf.presets.v1';
+let reportRows=[];
+
+const BUILTIN={
+  Basic:{minMs:500,maxMs:7000,maxCps:20},
+  Strict:{minMs:800,maxMs:6000,maxCps:17},
+  Lenient:{minMs:300,maxMs:8000,maxCps:25}
+};
+
+function timeMs(value){
+  const m=String(value).trim().match(/^(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{3})$/);
+  if(!m)return null;
+  return ((+(m[1]||0))*3600 + (+m[2])*60 + (+m[3]))*1000 + (+m[4]);
+}
+
+function parseSubtitles(text){
+  const src=String(text).replace(/^WEBVTT[^\n]*\n+/i,'').replace(/\r/g,'');
+  const cues=[];
+  src.split(/\n{2,}/).forEach(block=>{
+    const lines=block.trim().split('\n');
+    const arrow=lines.findIndex(x=>x.includes('-->'));
+    if(arrow<0)return;
+    const parts=lines[arrow].split('-->');
+    const start=timeMs(parts[0]);
+    const end=timeMs((parts[1]||'').trim().split(/\s+/)[0]);
+    cues.push({start,end,text:lines.slice(arrow+1).join('\n')});
+  });
+  return cues;
+}
+
+function qc(cues,rules){
+  const issues=[];
+  cues.forEach((cue,i)=>{
+    const add=(code,detail)=>issues.push({cue:i+1,code,detail});
+    if(cue.start===null||cue.end===null){
+      add('INVALID_TIME','시간 형식 오류');
+      return;
+    }
+    if(cue.end<=cue.start)add('INVALID_RANGE','종료 시간이 시작보다 빠르거나 같음');
+    const duration=cue.end-cue.start;
+    if(duration<rules.minMs)add('TOO_SHORT',`표시 시간이 ${rules.minMs}ms 미만`);
+    if(duration>rules.maxMs)add('TOO_LONG',`표시 시간이 ${rules.maxMs}ms 초과`);
+    const chars=cue.text.replace(/<[^>]+>/g,'').replace(/\s/g,'').length;
+    const cps=duration>0?chars/(duration/1000):0;
+    if(cps>rules.maxCps)add('HIGH_CPS',`읽기 속도 ${cps.toFixed(1)} CPS`);
+    if(i>0&&cue.start<cues[i-1].end)add('OVERLAP','이전 cue와 겹침');
+  });
+  return issues;
+}
+
+function esc(value){
+  return String(value).replace(/[&<>"']/g,ch=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[ch]));
+}
+
+function issueTable(el,issues){
+  el.innerHTML=issues.length
+    ? '<table><tr><th>Cue</th><th>Code</th><th>Detail</th></tr>'+
+      issues.map(x=>`<tr><td>${x.cue}</td><td>${esc(x.code)}</td><td>${esc(x.detail)}</td></tr>`).join('')+
+      '</table>'
+    : '<p>문제가 발견되지 않았습니다.</p>';
+}
+
+function defaultRules(){return {minMs:500,maxMs:7000,maxCps:20};}
+
+function customPresets(){
+  try{return JSON.parse(localStorage.getItem(STORAGE_KEY)||'{}')}
+  catch{return {}}
+}
+
+function allPresets(){return Object.assign({},BUILTIN,customPresets())}
+
+function refreshPresets(selected='Basic'){
+  const presets=allPresets();
+  $('preset').innerHTML=Object.keys(presets).map(name=>`<option>${esc(name)}</option>`).join('');
+  $('preset').value=presets[selected]?selected:'Basic';
+  applyPreset();
+}
+
+function applyPreset(){
+  const r=allPresets()[$('preset').value]||defaultRules();
+  $('presetName').value=$('preset').value;
+  $('minMs').value=r.minMs;
+  $('maxMs').value=r.maxMs;
+  $('maxCps').value=r.maxCps;
+}
+
+function activeRules(){
+  return {
+    minMs:+$('minMs').value||0,
+    maxMs:+$('maxMs').value||1,
+    maxCps:+$('maxCps').value||1
+  };
+}
+
+function runSingle(){
+  const cues=parseSubtitles($('singleText').value);
+  const issues=qc(cues,defaultRules());
+  $('singleSummary').textContent=`Cues ${cues.length} / Issues ${issues.length}`;
+  issueTable($('singleOutput'),issues);
+}
+
+async function runBatch(){
+  const files=[...$('batchFiles').files];
+  const rules=activeRules();
+  reportRows=[];
+  const summaryRows=[];
+  for(const file of files){
+    const cues=parseSubtitles(await file.text());
+    const issues=qc(cues,rules);
+    summaryRows.push([file.name,cues.length,issues.length]);
+    if(!cues.length)reportRows.push([file.name,'','NO_CUES','유효한 cue 없음']);
+    else if(!issues.length)reportRows.push([file.name,'','OK','문제 없음']);
+    else issues.forEach(x=>reportRows.push([file.name,x.cue,x.code,x.detail]));
+  }
+  $('batchSummary').textContent=`Files ${files.length} / Issues ${reportRows.filter(x=>x[2]!=='OK').length}`;
+  $('batchOutput').innerHTML='<table><tr><th>File</th><th>Cues</th><th>Issues</th></tr>'+
+    summaryRows.map(x=>`<tr><td>${esc(x[0])}</td><td>${x[1]}</td><td>${x[2]}</td></tr>`).join('')+
+    '</table>';
+  $('csvReport').disabled=!reportRows.length;
+}
+
+function exportCsv(){
+  const quote=v=>'"'+String(v??'').replace(/"/g,'""')+'"';
+  const rows=[['file','cue','code','detail'],...reportRows];
+  const csv='\uFEFF'+rows.map(r=>r.map(quote).join(',')).join('\r\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download='subtitle-qc-report.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+$('singleFile').onchange=async e=>{
+  const file=e.target.files[0];
+  if(file){$('singleText').value=await file.text();runSingle();}
+};
+$('runSingle').onclick=runSingle;
+$('preset').onchange=applyPreset;
+$('savePreset').onclick=()=>{
+  const custom=customPresets();
+  const name=$('presetName').value.trim()||'Custom';
+  custom[name]=activeRules();
+  localStorage.setItem(STORAGE_KEY,JSON.stringify(custom));
+  refreshPresets(name);
+};
+$('runBatch').onclick=runBatch;
+$('csvReport').onclick=exportCsv;
+refreshPresets();
+</script>
+</body>
+</html>
